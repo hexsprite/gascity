@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -231,6 +232,76 @@ func TestCityRuntimeDemandSnapshotReusesStablePatrolDemand(t *testing.T) {
 	_ = cr.loadDemandSnapshot(changedSessionBeads, nil, "poke", false)
 	if buildCalls != 3 {
 		t.Fatalf("buildDesiredState call count after poke = %d, want 3", buildCalls)
+	}
+}
+
+// Regression: gascityhall/gascity#2210. When gc sling stamps gc.routed_to on
+// a work bead, no session bead changes, so the session fingerprint is stable.
+// Without bead-event tracking the cached demand snapshot would be reused on
+// the next patrol tick and the pool would never spawn until either the
+// snapshot aged out or a manual bead bump fired another event. The fix
+// invalidates the snapshot whenever the controller observes any new
+// non-cache-reconcile bead event between snapshots.
+func TestCityRuntimeDemandSnapshotRefreshesOnNewBeadEvents(t *testing.T) {
+	buildCalls := 0
+	cs := &controllerState{
+		eventProv: events.NewFake(),
+	}
+	cr := &CityRuntime{
+		cityName: "test-city",
+		cityPath: t.TempDir(),
+		cfg: &config.City{
+			Workspace: config.Workspace{Name: "test-city"},
+		},
+		cs:     cs,
+		stderr: io.Discard,
+	}
+	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+		buildCalls++
+		return DesiredStateResult{State: map[string]TemplateParams{}}
+	}
+
+	sessionBeads := newSessionBeadSnapshot([]beads.Bead{{
+		ID:     "bead-1",
+		Status: "open",
+		Metadata: map[string]string{
+			"session_name": "worker-bd-1",
+			"template":     "worker",
+			"state":        "active",
+		},
+	}})
+
+	_ = cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
+	if buildCalls != 1 {
+		t.Fatalf("buildDesiredState call count after first patrol = %d, want 1", buildCalls)
+	}
+
+	// Stable patrol with no new bead events: snapshot reused.
+	_ = cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
+	if buildCalls != 1 {
+		t.Fatalf("buildDesiredState call count after stable patrol = %d, want 1", buildCalls)
+	}
+
+	// Simulate gc sling stamping gc.routed_to: a bead.updated event arrives
+	// at the controller, but no session bead changed.
+	cs.applyBeadEventToStores(events.Event{
+		Type:    events.BeadUpdated,
+		Actor:   "agent-runtime",
+		Subject: "work-bead-1",
+		Payload: json.RawMessage(`{"id":"work-bead-1"}`),
+	})
+
+	// Next patrol tick must refresh: otherwise the pool's scale_check
+	// counts stay stale and no polecat spawns.
+	_ = cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
+	if buildCalls != 2 {
+		t.Fatalf("buildDesiredState call count after bead event = %d, want 2 (snapshot must invalidate)", buildCalls)
+	}
+
+	// Stable again afterward.
+	_ = cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
+	if buildCalls != 2 {
+		t.Fatalf("buildDesiredState call count after second stable patrol = %d, want 2", buildCalls)
 	}
 }
 
