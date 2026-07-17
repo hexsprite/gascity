@@ -57,6 +57,21 @@ type controllerState struct {
 	// runtime reload loop. Runtime reloads that would drop newly bound rigs are
 	// ignored until the loop observes and applies the same or a newer config.
 	configMutationPending atomic.Bool
+
+	// beadEventCount increments on every non-cache-reconcile bead event the
+	// controller observes. Used by the reconciler to invalidate the cached
+	// demand snapshot when work beads change without changing the session
+	// bead fingerprint (e.g. gc.routed_to stamped by gc sling). See
+	// gascityhall/gascity#2210.
+	beadEventCount atomic.Uint64
+}
+
+// BeadEventCount returns the cumulative count of non-cache-reconcile bead
+// events the controller has applied. The reconciler uses this as a
+// monotonically increasing fingerprint to detect work-bead changes between
+// patrol ticks.
+func (cs *controllerState) BeadEventCount() uint64 {
+	return cs.beadEventCount.Load()
 }
 
 type configMutationSnapshot struct {
@@ -271,6 +286,7 @@ func (cs *controllerState) applyBeadEventToStores(evt events.Event) {
 		}
 	}
 	if evt.Actor != "cache-reconcile" {
+		cs.beadEventCount.Add(1)
 		cs.Poke()
 	}
 }

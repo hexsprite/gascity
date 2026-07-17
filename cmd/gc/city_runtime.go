@@ -93,7 +93,14 @@ const runtimeDemandSnapshotMaxAge = 30 * time.Second
 type runtimeDemandSnapshot struct {
 	createdAt          time.Time
 	sessionFingerprint string
-	result             DesiredStateResult
+	// beadEventCount is the controllerState.BeadEventCount() value observed
+	// when this snapshot was recorded. A later patrol tick refreshes the
+	// snapshot when the live counter exceeds this value, ensuring work-bead
+	// changes (e.g. gc sling stamping gc.routed_to on a fresh pool route)
+	// invalidate cached scale_check counts even when no session bead
+	// changed. See gascityhall/gascity#2210.
+	beadEventCount uint64
+	result         DesiredStateResult
 }
 
 // CityRuntimeParams holds the caller-provided parameters for creating a
@@ -1731,6 +1738,7 @@ func (cr *CityRuntime) loadDemandSnapshot(
 		cr.demandSnapshot = &runtimeDemandSnapshot{
 			createdAt:          time.Now(),
 			sessionFingerprint: sessionFingerprint,
+			beadEventCount:     cr.currentBeadEventCount(),
 			result:             result,
 		}
 	}
@@ -1759,7 +1767,25 @@ func (cr *CityRuntime) shouldRefreshDemandSnapshot(
 	if cr.demandSnapshot.sessionFingerprint != sessionFingerprint {
 		return true
 	}
+	// Work-bead changes (e.g. gc sling stamping gc.routed_to without
+	// touching any session bead) don't show up in sessionFingerprint, so a
+	// reused snapshot would keep stale scale_check counts and the pool
+	// would never spawn until the snapshot ages out. Refresh whenever the
+	// controller has observed any bead events since this snapshot was
+	// captured. See gascityhall/gascity#2210.
+	if cr.currentBeadEventCount() > cr.demandSnapshot.beadEventCount {
+		return true
+	}
 	return time.Since(cr.demandSnapshot.createdAt) >= runtimeDemandSnapshotMaxAge
+}
+
+// currentBeadEventCount returns the controllerState's bead event counter,
+// or 0 when no controllerState is attached (standalone mode, tests).
+func (cr *CityRuntime) currentBeadEventCount() uint64 {
+	if cr.cs == nil {
+		return 0
+	}
+	return cr.cs.BeadEventCount()
 }
 
 func (cr *CityRuntime) demandSnapshotsEnabled() bool {
